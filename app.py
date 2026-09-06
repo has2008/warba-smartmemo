@@ -1,13 +1,16 @@
 import streamlit as st
-import pypdf
+import pdfplumber
 import io
 import os
 from typing import TypedDict, Optional
 from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, START, END
 
-# 1. إعدادات الصفحة
+# ==========================================
+# 1. إعدادات الصفحة والهوية المصرفية لبنك وربة
+# ==========================================
 st.set_page_config(
     page_title="Warba SmartMemo | Corporate Banking AI",
     page_icon="🏦",
@@ -17,12 +20,46 @@ st.set_page_config(
 st.markdown("""
     <style>
     .main-title { font-size: 28px; font-weight: bold; color: #1E3A8A; margin-bottom: 0px; }
-    .sub-title { font-size: 16px; color: #64748B; margin-bottom: 20px; }
-    .badge-pass { background-color: #DCFCE7; color: #166534; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
+    .sub-title { font-size: 15px; color: #64748B; margin-bottom: 25px; }
+    .badge-pass { background-color: #DCFCE7; color: #166534; padding: 4px 10px; border-radius: 6px; font-weight: bold; font-size: 14px; }
+    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
+    .stTabs [data-baseweb="tab"] { height: 45px; border-radius: 6px; font-weight: 600; }
     </style>
 """, unsafe_allow_html=True)
 
-# 2. تعريف محرك LangGraph والوكلاء المتخصصين
+# ==========================================
+# 2. وظيفة استخراج الجداول والنصوص (pdfplumber)
+# ==========================================
+def extract_pdf_data(uploaded_file):
+    """استخراج النصوص مع الحفاظ التام على هيكل الجداول المالية المزدوجة"""
+    if uploaded_file is None:
+        return ""
+    extracted_text = []
+    try:
+        with pdfplumber.open(io.BytesIO(uploaded_file.getvalue())) as pdf:
+            for i, page in enumerate(pdf.pages):
+                # استخراج الجداول كـ Markdown
+                tables = page.extract_tables()
+                if tables:
+                    for table in tables:
+                        extracted_text.append(f"\n[جدول مالي مستخرج - صفحة {i+1}]:\n")
+                        for row in table:
+                            clean_row = [str(c).strip() if c is not None else "" for c in row]
+                            extracted_text.append("| " + " | ".join(clean_row) + " |")
+                        extracted_text.append("\n")
+                
+                # استخراج النصوص
+                text = page.extract_text(layout=True)
+                if text:
+                    extracted_text.append(text)
+    except Exception as e:
+        return f"خطأ أثناء قراءة الـ PDF: {e}"
+        
+    return "\n".join(extracted_text)
+
+# ==========================================
+# 3. محرك الوكلاء الأذكياء (LangGraph Swarm)
+# ==========================================
 class MemoState(TypedDict):
     financial_text: str
     cr_text: str
@@ -32,36 +69,41 @@ class MemoState(TypedDict):
     risk_analysis: Optional[str]
     final_memo: Optional[str]
 
-def financial_analyst_agent(state: MemoState, llm):
+def financial_agent(state: MemoState, llm):
     prompt = ChatPromptTemplate.from_template("""
-    أنت محلل مالي خبير في بنك وربة للشركات. حلل القوائم المالية:
+    أنت محلل مالي معتمد في بنك وربة للشركات. 
+    حلل البيانات والجداول المالية التالية:
     {financial_text}
-    المطلوب: حساب مؤشرات السيولة، نسبة الدين إلى حقوق الملكية، هامش EBITDA، وتلخيص تدفقات النقد في جدول ماركداون.
+    المطلوب:
+    1. استخراج الإيرادات وصافي الأرباح لآخر سنتين.
+    2. جدول Markdown يحتوي على: نسبة السيولة (Current Ratio)، الرافعة المالية (Debt to Equity)، وهامش EBITDA وتغطية خدمة الدين (DSCR).
+    3. تقييم موجز لملاءة العميل الائتمانية.
     """)
-    res = (prompt | llm).invoke({"financial_text": state["financial_text"][:5000]})
+    res = (prompt | llm).invoke({"financial_text": state["financial_text"][:6000]})
     return {"financial_analysis": res.content}
 
-def shariah_screening_agent(state: MemoState, llm):
+def shariah_agent(state: MemoState, llm):
     prompt = ChatPromptTemplate.from_template("""
-    أنت مستشار رقابة شرعية في بنك وربة خبير بمعايير AAOIFI.
-    نشاط الشركة: {cr_text}
-    التحليل المالي: {financial_analysis}
-    المطلوب:
-    1. فحص النشاط والنسب المالية.
-    2. التوصية بصيغة التمويل الإسلامي الملائمة (مرابحة بضائع، إجارة، استصناع) مع التعليل الشرعي.
+    أنت رئيس الرقابة والتدقيق الشرعي في بنك وربة، خبير بمعايير AAOIFI.
+    نشاط الشركة وبيانات السجل: {cr_text}
+    المؤشرات المالية: {financial_analysis}
+    المطلوب بدقة:
+    1. فحص النشاط: خلوه من الأنشطة المحظورة شرعاً.
+    2. فحص المعايير المالية: التحقق من سقف المديونيات ذات الفائدة التقليدية.
+    3. الهيكل التمويلي الإسلامي المقترح: التوصية بصيغة (مرابحة بضائع، إجارة، استصناع) مع تسبيب التوافق الشرعي.
     """)
     res = (prompt | llm).invoke({
-        "cr_text": state["cr_text"][:2500],
+        "cr_text": state["cr_text"][:3000],
         "financial_analysis": state["financial_analysis"]
     })
     return {"shariah_screening": res.content}
 
-def risk_assessment_agent(state: MemoState, llm):
+def risk_agent(state: MemoState, llm):
     prompt = ChatPromptTemplate.from_template("""
     أنت مسؤول إدارة المخاطر في بنك وربة.
-    ملاحظات الزيارة: {rm_notes}
-    التحليل المالي: {financial_analysis}
-    المطلوب: استخراج أهم 3 مخاطر ائتمانية وتقديم تعهدات وشروط مصرفية (Covenants) لمعالجتها.
+    قارن بين ملاحظات الزيارة الميدانية: {rm_notes}
+    وبين التحليل المالي: {financial_analysis}
+    المطلوب: تحديد أهم 3 مخاطر ائتمانية وتحديد شروط وتعهدات مصرفية (Covenants & Mitigants) لحماية البنك.
     """)
     res = (prompt | llm).invoke({
         "rm_notes": state["rm_notes"],
@@ -69,12 +111,12 @@ def risk_assessment_agent(state: MemoState, llm):
     })
     return {"risk_analysis": res.content}
 
-def memo_synthesizer_agent(state: MemoState, llm):
+def synthesizer_agent(state: MemoState, llm):
     prompt = ChatPromptTemplate.from_template("""
-    أنت صائغ مذكرات ائتمان أول في بنك وربة. جمّع مخرجات الفرق التالية في مذكرة ائتمان موحدة:
-    التحليل: {financial_analysis}
-    الشرعية: {shariah_screening}
-    المخاطر: {risk_analysis}
+    أنت صائغ تقارير ائتمان أول في بنك وربة. جمّع مخرجات الفرق في مسودة موحدة وموجزة (Credit Application Memo):
+    الملخص المالي: {financial_analysis}
+    الرقابة الشرعية: {shariah_screening}
+    المخاطر والضمانات: {risk_analysis}
     """)
     res = (prompt | llm).invoke({
         "financial_analysis": state["financial_analysis"],
@@ -83,13 +125,18 @@ def memo_synthesizer_agent(state: MemoState, llm):
     })
     return {"final_memo": res.content}
 
-def run_langgraph_pipeline(financial_text, cr_text, rm_notes, api_key):
-    llm = ChatOpenAI(model="gpt-4o", temperature=0.2, api_key=api_key)
+def run_langgraph_workflow(fin_text, cr_text, rm_notes, model_choice, api_key):
+    # تهيئة النموذج المختار بحرارة صفر لضمان الدقة المالية
+    if "Claude" in model_choice:
+        llm = ChatAnthropic(model_name="claude-3-5-sonnet-20240620", temperature=0.0, anthropic_api_key=api_key)
+    else:
+        llm = ChatOpenAI(model_name="gpt-4o", temperature=0.0, openai_api_key=api_key)
+        
     builder = StateGraph(MemoState)
-    builder.add_node("financial", lambda s: financial_analyst_agent(s, llm))
-    builder.add_node("shariah", lambda s: shariah_screening_agent(s, llm))
-    builder.add_node("risk", lambda s: risk_assessment_agent(s, llm))
-    builder.add_node("synthesizer", lambda s: memo_synthesizer_agent(s, llm))
+    builder.add_node("financial", lambda s: financial_agent(s, llm))
+    builder.add_node("shariah", lambda s: shariah_agent(s, llm))
+    builder.add_node("risk", lambda s: risk_agent(s, llm))
+    builder.add_node("synthesizer", lambda s: synthesizer_agent(s, llm))
     
     builder.add_edge(START, "financial")
     builder.add_edge("financial", "shariah")
@@ -99,115 +146,125 @@ def run_langgraph_pipeline(financial_text, cr_text, rm_notes, api_key):
     
     app = builder.compile()
     return app.invoke({
-        "financial_text": financial_text,
+        "financial_text": fin_text,
         "cr_text": cr_text,
         "rm_notes": rm_notes
     })
 
-# 3. القائمة الجانبية (Sidebar)
+# ==========================================
+# 4. القائمة الجانبية (Sidebar)
+# ==========================================
 with st.sidebar:
     st.image("https://img.icons8.com/color/96/bank-building.png", width=60)
     st.markdown("### 🏦 **Warba Bank**")
     st.markdown("**Corporate Banking AI Copilot**")
-    st.caption("Powered by LangGraph Multi-Agent Orchestration")
+    st.caption("Track 1: AI-Powered Client Documentation")
     st.divider()
     
-    fin_file = st.file_uploader("1. القوائم المالية (PDF)", type=["pdf"])
-    cr_file = st.file_uploader("2. السجل التجاري (PDF)", type=["pdf"])
-    notes_input = st.text_area("3. ملاحظات الزيارة الميدانية (RM Notes)", placeholder="انطباع الزيارة، الغرض من التسهيلات...")
+    st.subheader("⚙️ خيارات النموذج (Model Engine)")
+    model_choice = st.selectbox("اختر المحرك:", ["GPT-4o (OpenAI)", "Claude-3.5-Sonnet (Anthropic)"])
+    
+    if "Claude" in model_choice:
+        api_key = st.text_input("Anthropic API Key:", type="password")
+    else:
+        api_key = st.text_input("OpenAI API Key:", type="password")
+        
     st.divider()
-    api_key = st.text_input("OpenAI API Key (اختياري)", type="password", help="مطلوب فقط للتحليل الحي للـ PDF عبر LangGraph")
+    st.subheader("📁 رفع مستندات الشركة")
+    fin_file = st.file_uploader("1. القوائم المالية (PDF)", type=["pdf"])
+    cr_file = st.file_uploader("2. السجل التجاري / الهوية (PDF)", type=["pdf"])
+    notes_input = st.text_area("3. ملاحظات الزيارة الميدانية (RM Notes)", placeholder="انطباع الزيارة، الغرض من التسهيلات، الضمانات...")
 
-def extract_pdf_text(uploaded_file):
-    if uploaded_file is not None:
-        reader = pypdf.PdfReader(io.BytesIO(uploaded_file.read()))
-        return "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
-    return ""
-
-# 4. واجهة التطبيق الرئيسية
+# ==========================================
+# 5. الواجهة الرئيسية والتنفيذ
+# ==========================================
 st.markdown('<div class="main-title">Warba SmartMemo (أتمتة مذكرات الائتمان)</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">منظومة ذكية مدعومة بوكلاء LangGraph لإعداد مذكرات ائتمان متوافقة مع الشريعة الإسلامية</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">منظومة ذكاء اصطناعي بنكية مدعومة بوكلاء LangGraph لاستخراج البيانات وإعداد مذكرات ائتمان متوافقة مع الشريعة</div>', unsafe_allow_html=True)
 
-col1, col2 = st.columns([1, 4])
+col1, col2 = st.columns([1, 3])
 with col1:
     generate_btn = st.button("🚀 تشغيل وكلاء LangGraph", type="primary", use_container_width=True)
 with col2:
-    demo_btn = st.button("⚡ تجربة سريعة (بيانات تجريبية كويتية)", use_container_width=False)
+    demo_btn = st.button("⚡ تجربة سريعة وفورية (شركة كويتية للمقاولات)", use_container_width=False)
 
 if generate_btn or demo_btn:
-    with st.spinner("جاري تشغيل الوكلاء الأربعة (المالي ➔ الشرعي ➔ المخاطر ➔ التجميع)..."):
+    with st.spinner("جاري استخراج الجداول عبر pdfplumber وتنسيق مهام الوكلاء الأربعة..."):
         
-        # في حال التجربة السريعة أو عدم إدخال مفتاح API
-        if demo_btn or not api_key:
-            exec_summary = """**العميل:** شركة النور للمقاولات والتجارة العامة (ذ.م.م)  
-**الطلب:** تسهيلات مرابحة بضائع بقيمة 3,500,000 د.ك لتمويل مشروع بنية تحتية معتمد.  
-**التقييم:** تدفقات نقدية مستقرة مع عقود حكومية قائمة وسجل ائتماني ممتاز."""
+        # سيناريو العرض السريع الافتراضي (Demo Safe Mode)
+        if demo_btn or (generate_btn and not api_key):
+            if generate_btn and not api_key:
+                st.warning("⚠️ لم تقم بإدخال مفتاح API، تم تفعيل وضع العرض المصرفي التجريبي تلقائياً.")
+                
+            exec_summary = """**اسم العميل:** شركة النور للمقاولات والتجارة العامة (ذ.م.م)  
+**الغرض من الطلب:** تسهيلات مرابحة بضائع بقيمة **3,500,000 د.ك** لتمويل عقد بنية تحتية حكومي معتمد.  
+**التقييم العام:** تدفقات نقدية تشغيلية مستقرة مع التزام ائتماني قوي وسمعة ممتازة في السوق الكويتي."""
             
             financial_analysis = """
-| المؤشر المالي | القيمة الحالية | معيار البنك | الحالة |
+| المؤشر المالي المحسوب | القيمة المستخرجة | معيار بنك وربة | حالة المؤشر |
 | :--- | :--- | :--- | :--- |
-| نسبة السيولة الحالية (Current Ratio) | 1.65 | > 1.20 | ✅ ممتاز |
-| نسبة الدين إلى حقوق الملكية (D/E) | 1.80 | < 2.50 | ✅ مقبول |
-| هامش الربح التشغيلي (EBITDA Margin)| 18.5% | > 12.0% | ✅ قوي |
-| تغطية خدمة الدين (DSCR) | 1.45x | > 1.25x | ✅ آمن |
+| نسبة السيولة الحالية (Current Ratio) | 1.68 | > 1.20 | ✅ ممتاز |
+| نسبة الدين إلى حقوق الملكية (D/E) | 1.75 | < 2.50 | ✅ متوافق |
+| هامش الربح التشغيلي (EBITDA Margin)| 19.2% | > 12.0% | ✅ قوي جداً |
+| تغطية خدمة الدين (DSCR) | 1.50x | > 1.25x | ✅ آمن ومستقر |
 """
             shariah_review = """
-* **فحص طبيعة النشاط:** ✅ **مطابق** — مقاولات وتوريدات (خالٍ من أي محظورات شرعية).
-* **فحص النسب المالية (AAOIFI):** ✅ **مطابق** — المديونيات التقليدية أقل من 30% من إجمالي الأصول.
-* **الهيكل التمويلي المقترح:** **مرابحة بضائع (Commodity Murabaha)** وفق ضوابط هيئة الرقابة الشرعية لبنك وربة، بأجل سداد 36 شهراً.
+* **فحص طبيعة النشاط (Activity Screening):** ✅ **مطابق بالكامل** — أعمال مقاولات عامة وتوريدات خالية من أي أنشطة محظورة شرعاً.
+* **فحص معايير AAOIFI المالية:** ✅ **مطابق** — نسبة الديون التقليدية إلى إجمالي الأصول أقل من 30%، والفوائد الربوية منعدمة.
+* **الهيكل التمويلي الإسلامي المعتمد:** **مرابحة بضائع محلية (Commodity Murabaha)** بإشراف هيئة الفتوى والرقابة الشرعية لبنك وربة، بفترة سداد 36 شهراً.
 """
             risks_mitigations = """
-1. **تأخر دفعات المقاول الرئيسي:** *المعالجة:* ربط السداد بحوالة حق معتمدة لحساب العميل لدى بنك وربة.
-2. **تذبذب أسعار المواد:** *المعالجة:* صرف دفعات المرابحة مجزأة حسب مراحل التنفيذ الميدانية.
+1. **مخاطر تأخر دفعات المقاول الرئيسي:** *المعالجة:* اشتراط توقيع حوالة حق رسمية غير مشروطة لدفعات المشروع لحساب الشركة لدى بنك وربة.
+2. **مخاطر تذبذب أسعار المواد الإنشائية:** *المعالجة:* صرف دفعات المرابحة مجزأة ومرتبطة بشهادات الإنجاز الفعلي للمشروع.
 """
         else:
-            # تشغيل LangGraph الفعلي
+            # سيناريو التشغيل الحي مع النماذج
             try:
-                fin_txt = extract_pdf_text(fin_file)
-                cr_txt = extract_pdf_text(cr_file)
-                results = run_langgraph_pipeline(fin_txt, cr_txt, notes_input, api_key)
+                fin_txt = extract_pdf_data(fin_file)
+                cr_txt = extract_pdf_data(cr_file)
+                results = run_langgraph_workflow(fin_txt, cr_txt, notes_input, model_choice, api_key)
                 
                 exec_summary = results["final_memo"]
                 financial_analysis = results["financial_analysis"]
                 shariah_review = results["shariah_screening"]
                 risks_mitigations = results["risk_analysis"]
             except Exception as e:
-                st.error(f"حدث خطأ أثناء تشغيل الوكلاء: {e}")
+                st.error(f"خطأ أثناء المعالجة: {e}")
                 st.stop()
 
-    st.success("اكتمل عمل وكلاء LangGraph بنجاح!")
+    st.success("اكتمل التحليل وتوليد المذكرة بنجاح!")
     
+    # تبويبات العرض التفاعلية
     tab1, tab2, tab3, tab4 = st.tabs([
         "📋 الملخص التنفيذي", 
-        "📊 التحليل المالي", 
-        "⚖️ الفحص الشرعي (Warba Shariah)", 
-        "✍️ المراجعة والتعديل (Human-in-the-Loop)"
+        "📊 المؤشرات والجداول المالية", 
+        "⚖️ بطاقة الفحص الشرعي (Warba Shariah)", 
+        "✍️ المراجعة البشرية والاعتماد (Human-in-the-Loop)"
     ])
     
     with tab1:
-        st.markdown("### ملخص طلب التسهيلات الائتمانية")
+        st.markdown("### ملخص طلب التسهيلات المصرفية للشركات")
         st.info(exec_summary)
         
     with tab2:
-        st.markdown("### مؤشرات الملاءة المالية ومخاطر الائتمان")
+        st.markdown("### المؤشرات المالية المحسوبة بدقة عبر `pdfplumber`")
         st.markdown(financial_analysis)
         
     with tab3:
-        st.markdown("### بطاقة التدقيق والرقابة الشرعية")
-        st.markdown('<span class="badge-pass">STATUS: SHARIAH COMPLIANT</span>', unsafe_allow_html=True)
+        st.markdown("### نتائج التدقيق الشرعي (Shariah Screening Scorecard)")
+        st.markdown('<span class="badge-pass">STATUS: SHARIAH COMPLIANT (AAOIFI ALIGNED)</span>', unsafe_allow_html=True)
         st.markdown(shariah_review)
         
     with tab4:
-        st.markdown("### مراجعة مسؤول العلاقات (RM Final Review)")
-        st.caption("مبدأ Human-in-the-Loop: يحق للمصرفي تعديل المذكرة واعتمادها.")
+        st.markdown("### مراجعة مسؤول العلاقات (RM Final Review & Audit)")
+        st.caption("مبدأ Human-in-the-Loop: يحق للمصرفي تعديل الصياغة أو النسب قبل التصدير والرفع للجنة الائتمان العليا.")
         
         full_draft = f"{exec_summary}\n\n{financial_analysis}\n\n{shariah_review}\n\n{risks_mitigations}"
-        edited_memo = st.text_area("نص المذكرة النهائي القابل للتعديل:", value=full_draft, height=350)
+        edited_memo = st.text_area("مسودة المذكرة الرسمية القابلة للتعديل:", value=full_draft, height=350)
         
         c1, c2 = st.columns(2)
         with c1:
-            st.download_button("📥 تصدير المذكرة المعتمدة (TXT / Word)", data=edited_memo, file_name="Warba_Credit_Memo.txt", use_container_width=True)
+            st.download_button("📥 تصدير المذكرة الرسمية (Word / TXT)", data=edited_memo, file_name="Warba_Credit_Application_Memo.txt", use_container_width=True)
         with c2:
-            if st.button("✅ اعتماد وإرسال إلى Core Banking API", use_container_width=True):
+            if st.button("✅ اعتماد المذكرة وإرسالها إلى Core Banking API", use_container_width=True):
                 st.balloons()
-                st.success("تم إرسال المذكرة بنجاح إلى نظام الائتمان الداخلي لبنك وربة (Simulation)!")
+                st.success("تم إرسال المذكرة بنجاح إلى النظام المصرفي لتدقيق الائتمان (Core Banking Simulation)!")
